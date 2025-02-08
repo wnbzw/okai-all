@@ -27,4 +27,12 @@ public interface AppService extends IService<App> {
     Wrapper<App> getQueryWrapper(AppQueryRequest appQueryRequest);
 
     Page<AppVO> getAppVOPage(Page<App> appPage, HttpServletRequest request);
+
+    /**
+     * 从 ES 查询
+     *
+     * @param appQueryRequest
+     * @return
+     */
+    Page<App> searchFromEs(AppQueryRequest appQueryRequest);
 }

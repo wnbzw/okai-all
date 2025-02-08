@@ -1,8 +1,10 @@
 package com.zw.okai.controller;
 
 
+import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.zhipu.oapi.service.v4.model.ModelData;
 import com.zw.okai.annotation.AuthCheck;
 import com.zw.okai.common.BaseResponse;
 import com.zw.okai.common.DeleteRequest;
@@ -11,19 +13,30 @@ import com.zw.okai.common.ResultUtils;
 import com.zw.okai.constant.UserConstant;
 import com.zw.okai.exception.BusinessException;
 import com.zw.okai.exception.ThrowUtils;
+import com.zw.okai.manager.AiManager;
 import com.zw.okai.model.dto.question.*;
+import com.zw.okai.model.entity.App;
 import com.zw.okai.model.entity.Question;
 import com.zw.okai.model.entity.User;
+import com.zw.okai.model.enums.AppTypeEnum;
 import com.zw.okai.model.vo.QuestionVO;
+import com.zw.okai.service.AppService;
 import com.zw.okai.service.QuestionService;
 import com.zw.okai.service.UserService;
+import io.reactivex.Flowable;
+import io.reactivex.Scheduler;
+import io.reactivex.schedulers.Schedulers;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.BeanUtils;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 题目接口
@@ -38,6 +51,15 @@ public class QuestionController {
 
     @Resource
     private UserService userService;
+
+    @Resource
+    private AppService appService;
+
+    @Resource
+    private AiManager aiManager;
+
+    @Resource
+    private Scheduler vipScheduler;
 
     //region 增删改查
 
@@ -239,5 +261,156 @@ public class QuestionController {
         ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
         return ResultUtils.success(true);
     }
+    //endregion
+
+    // region AI生成题目
+
+    private static final String GENERATE_TEST_QUESTION_SYSTEM_MESSAGE = "你是一个严谨精确的出题专家，我会给你如下信息：\n" +
+            "```\n" +
+            "应用名称，\n" +
+            "【【【应用描述】】】，\n" +
+            "应用类别，\n" +
+            "要生成的题目数，\n" +
+            "每个题目的选项数\n" +
+            "```\n" +
+            "\n" +
+            "请你根据上述信息，按照以下步骤来出题：\n" +
+            "1.要求：题目和选项尽可能地短,开头不需要包含应用名称，题目不要包含序号，每题的选项数以我提供的为主，题目和选项不能重复\n" +
+            "2.严格按照下面的 json 格式输出题目和选项\n" +
+            "```\n" +
+            "[{\"options\":[{\"value\":\"选项内容\",\"key\":\"A\"},{\"value\":\"\",\"key\":\"B\"}],\"title\":\"题目标题\"}]\n" +
+            "```\n" +
+            "title 是题目，options 是选项，每个选项的 key 按照英文字母序（比如 A、B、C、D）以此类推，value 是选项内容，必须准确严谨\n" +
+            "3.返回的题目列表格式必须为 JSON 数组";
+
+    private static final String GENERATE_SCORE_QUESTION_SYSTEM_MESSAGE = "你是一个高水平的出题专家，我会给你如下信息：\n" +
+            "```\n" +
+            "应用名称，\n" +
+            "【【【应用描述】】】，\n" +
+            "应用类别，\n" +
+            "要生成的题目数，\n" +
+            "每个题目的选项数\n" +
+            "```\n" +
+            "\n" +
+            "请你根据上述信息，按照以下步骤来出题：\n" +
+            "1.要求：题目和选项要简短,开头不需要包含应用名称，题目不要包含序号，每题的选项数以我提供的为主，题目和选项不能重复\n" +
+            "2.严格按照下面的 json 格式输出题目和选项\n" +
+            "```\n" +
+            "[{\"options\":[{\"value\":\"选项内容\",\"key\":\"A\",\"score\":\"选项得分\"},{\"value\":\"\",\"key\":\"B\",\"score\":\"选项得分\"}],\"title\":\"题目标题\"}]\n" +
+            "```\n" +
+            "title 是题目，options 是选项（尽量只有一个正确答案），每个选项的 key 按照英文字母序（比如 A、B、C、D）以此类推，value 是选项内容，必须准确严谨" +
+            "，score是该选项得分，如果题目只有一个正确答案，正确答案为10分，其他选项为0分，如果题目是发散型的题目，自己判断给答案得分0-10分\n" +
+            "3.返回的题目列表格式必须为 JSON 数组";
+
+    private String getGenerateQuestionUserMessage(App app, int questionNumber, int optionNumber) {
+        StringBuilder userMessage = new StringBuilder();
+        userMessage.append(app.getAppName()).append("\n");
+        userMessage.append(app.getAppDesc()).append("\n");
+        userMessage.append(AppTypeEnum.getEnumByValue(app.getAppType()).getText()).append("\n");
+        userMessage.append(questionNumber).append("\n");
+        userMessage.append(optionNumber);
+        return userMessage.toString();
+    }
+
+    /**
+     * AI生成题目
+     * @param aiGenerateQuestionRequest
+     * @return
+     */
+    @PostMapping("/ai_generate")
+    public BaseResponse<List<QuestionContentDTO>> aiGenerateQuestion(@RequestBody AiGenerateQuestionRequest aiGenerateQuestionRequest, HttpServletRequest request) {
+        ThrowUtils.throwIf(aiGenerateQuestionRequest == null, ErrorCode.PARAMS_ERROR);
+        //获取参数
+        Long appId = aiGenerateQuestionRequest.getAppId();
+        int questionNumber = aiGenerateQuestionRequest.getQuestionNumber();
+        int optionNumber = aiGenerateQuestionRequest.getOptionNumber();
+        ThrowUtils.throwIf(appId == null || questionNumber <= 0 || optionNumber <= 0, ErrorCode.PARAMS_ERROR);
+        
+        App app = appService.getById(appId);
+        User loginUser = userService.getLoginUser(request);
+        ThrowUtils.throwIf(loginUser == null, ErrorCode.NOT_LOGIN_ERROR);
+        ThrowUtils.throwIf(app == null, ErrorCode.PARAMS_ERROR, "应用不存在");
+        //封装Prompt
+        String userMessage = getGenerateQuestionUserMessage(app, questionNumber, optionNumber);
+        //调用ai生成题目
+        String aiResponse = null;
+        if(app.getAppType() == 1){
+            aiResponse = aiManager.doSyncUnstableRequest(GENERATE_TEST_QUESTION_SYSTEM_MESSAGE, userMessage);
+        }else{
+            aiResponse = aiManager.doSyncUnstableRequest(GENERATE_SCORE_QUESTION_SYSTEM_MESSAGE, userMessage);
+        }
+        //解析ai返回的json数据
+        int start=aiResponse.indexOf("[");
+        int end=aiResponse.lastIndexOf("]");
+        String json=aiResponse.substring(start,end+1);
+        List<QuestionContentDTO> questionContentDTOList = JSONUtil.toList(JSONUtil.parseArray(json), QuestionContentDTO.class);
+        return ResultUtils.success(questionContentDTOList);
+    }
+
+    @GetMapping("/ai_generate/sse")
+    public SseEmitter aiGenerateQuestionSSE(AiGenerateQuestionRequest aiGenerateQuestionRequest, HttpServletRequest request) {
+        ThrowUtils.throwIf(aiGenerateQuestionRequest == null, ErrorCode.PARAMS_ERROR);
+        //获取参数
+        Long appId = aiGenerateQuestionRequest.getAppId();
+        int questionNumber = aiGenerateQuestionRequest.getQuestionNumber();
+        int optionNumber = aiGenerateQuestionRequest.getOptionNumber();
+        ThrowUtils.throwIf(appId == null || questionNumber <= 0 || optionNumber <= 0, ErrorCode.PARAMS_ERROR);
+
+        App app = appService.getById(appId);
+        ThrowUtils.throwIf(app == null, ErrorCode.PARAMS_ERROR, "应用不存在");
+        //封装Prompt
+        String userMessage = getGenerateQuestionUserMessage(app, questionNumber, optionNumber);
+        // 建立 SSE 连接对象，0 表示不超时
+        SseEmitter emitter = new SseEmitter(0L);
+        // AI 生成，sse 流式返回
+        Flowable<ModelData> modelDataFlowable = aiManager.doStreamRequest(GENERATE_TEST_QUESTION_SYSTEM_MESSAGE, userMessage, null);
+
+        //默认全局线程池
+        Scheduler scheduler = Schedulers.single();
+        User loginUser = userService.getLoginUser(request);
+        if ("vip".equals(loginUser.getUserRole())){
+            scheduler = vipScheduler;
+        }
+        StringBuilder contentBuilder = new StringBuilder();
+        AtomicInteger flag = new AtomicInteger(0);
+        modelDataFlowable
+                .observeOn(scheduler)
+                .map(chunk -> chunk.getChoices().get(0).getDelta().getContent())
+                .map(message -> message.replaceAll("\\s",""))
+                .filter(StrUtil::isNotBlank)
+                .flatMap(message -> {
+                    //将字符串转换为List<Character>
+                    List<Character> characters = new ArrayList<>();
+                    for (char c : message.toCharArray()) {
+                        characters.add(c);
+                    }
+                    return Flowable.fromIterable(characters);
+                })
+                .doOnNext(c -> {
+                    {
+                        // 识别第一个 { 表示开始 AI 传输 json 数据，打开 flag 开始拼接 json 数组
+                        if (c == '{') {
+                            flag.addAndGet(1);
+                        }
+                        if (flag.get() > 0) {
+                            contentBuilder.append(c);
+                        }
+                        if (c == '}') {
+                            flag.addAndGet(-1);
+                            if (flag.get() == 0) {
+                                // 累积单套题目满足 json 格式后，sse 推送至前端
+                                // sse 需要压缩成当行 json，sse 无法识别换行
+                                emitter.send(JSONUtil.toJsonStr(contentBuilder.toString()));
+                                // 清空 StringBuilder
+                                contentBuilder.setLength(0);
+                            }
+                        }
+                    }
+                }).doOnComplete(emitter::complete).subscribe();
+
+        return emitter;
+
+    }
+
     //endregion
 }

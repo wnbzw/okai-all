@@ -10,6 +10,7 @@ import com.zw.okai.constant.CommonConstant;
 import com.zw.okai.exception.BusinessException;
 import com.zw.okai.exception.ThrowUtils;
 import com.zw.okai.mapper.AppMapper;
+import com.zw.okai.model.dto.app.AppEsDTO;
 import com.zw.okai.model.dto.app.AppQueryRequest;
 import com.zw.okai.model.entity.App;
 import com.zw.okai.model.entity.User;
@@ -24,6 +25,16 @@ import com.zw.okai.utils.SqlUtils;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.ObjectUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.elasticsearch.index.query.BoolQueryBuilder;
+import org.elasticsearch.index.query.QueryBuilders;
+import org.elasticsearch.search.sort.SortBuilder;
+import org.elasticsearch.search.sort.SortBuilders;
+import org.elasticsearch.search.sort.SortOrder;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.elasticsearch.core.ElasticsearchRestTemplate;
+import org.springframework.data.elasticsearch.core.SearchHits;
+import org.springframework.data.elasticsearch.core.query.NativeSearchQuery;
+import org.springframework.data.elasticsearch.core.query.NativeSearchQueryBuilder;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
@@ -44,6 +55,84 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App> implements AppSe
 
     @Resource
     private UserService userService;
+
+    @Resource
+    private ElasticsearchRestTemplate elasticsearchRestTemplate;
+
+    @Override
+    public Page<App> searchFromEs(AppQueryRequest appQueryRequest) {
+        String appName = appQueryRequest.getAppName();
+        String appDesc = appQueryRequest.getAppDesc();
+        Integer appType = appQueryRequest.getAppType();
+        Integer scoringStrategy = appQueryRequest.getScoringStrategy();
+        Long id = appQueryRequest.getId();
+        Long userId = appQueryRequest.getUserId();
+        Long notId = appQueryRequest.getNotId();
+        String searchText = appQueryRequest.getSearchText();
+        // es 起始页为 0
+        long current = appQueryRequest.getCurrent() - 1;
+        long pageSize = appQueryRequest.getPageSize();
+        String sortField = appQueryRequest.getSortField();
+        String sortOrder = appQueryRequest.getSortOrder();
+        BoolQueryBuilder boolQueryBuilder = QueryBuilders.boolQuery();
+        //过滤
+        boolQueryBuilder.filter(QueryBuilders.termQuery("isDelete",0));
+        if (appType != null) {
+            boolQueryBuilder.filter(QueryBuilders.termQuery("appType", appType));
+        }
+        if (scoringStrategy != null) {
+            boolQueryBuilder.filter(QueryBuilders.termQuery("scoringStrategy", scoringStrategy));
+        }
+        if (id != null) {
+            boolQueryBuilder.filter(QueryBuilders.termQuery("id", id));
+        }
+        if (notId != null) {
+            boolQueryBuilder.mustNot(QueryBuilders.termQuery("id", notId));
+        }
+        if (userId != null) {
+            boolQueryBuilder.filter(QueryBuilders.termQuery("userId", userId));
+        }
+        // 按关键词检索
+        if (StringUtils.isNotBlank(searchText)) {
+            boolQueryBuilder.should(QueryBuilders.matchQuery("appName", searchText));
+            boolQueryBuilder.should(QueryBuilders.matchQuery("appDesc", searchText));
+            boolQueryBuilder.minimumShouldMatch(1);
+        }
+        // 按应用名称检索
+        if (StringUtils.isNotBlank(appName)) {
+            boolQueryBuilder.should(QueryBuilders.termQuery("appName", appName));
+            boolQueryBuilder.minimumShouldMatch(1);
+        }
+        // 按应用描述检索
+        if (StringUtils.isNotBlank(appDesc)) {
+            boolQueryBuilder.should(QueryBuilders.termQuery("appDesc", appDesc));
+            boolQueryBuilder.minimumShouldMatch(1);
+        }
+        // 排序
+        SortBuilder<?> sortBuilder = SortBuilders.scoreSort();
+        if (StringUtils.isNotBlank(sortField)) {
+            sortBuilder = SortBuilders.fieldSort(sortField);
+            sortBuilder.order(CommonConstant.SORT_ORDER_ASC.equals(sortOrder) ? SortOrder.ASC : SortOrder.DESC);
+        }
+        // 分页
+        PageRequest pageRequest = PageRequest.of((int) current, (int) pageSize);
+        // 构造查询
+        NativeSearchQuery searchQuery = new NativeSearchQueryBuilder().withQuery(boolQueryBuilder)
+                .withPageable(pageRequest).withSorts(sortBuilder).build();
+        SearchHits<AppEsDTO> searchHits = elasticsearchRestTemplate.search(searchQuery, AppEsDTO.class);
+        Page<App> page = new Page<>();
+        page.setTotal(searchHits.getTotalHits());
+        List<App> appList = new ArrayList<>();
+        if (searchHits.hasSearchHits()){
+            searchHits.forEach(searchHit -> {
+                AppEsDTO appEsDTO = searchHit.getContent();
+                App app = AppEsDTO.dtoToObj(appEsDTO);
+                appList.add(app);
+            });
+        }
+        page.setRecords(appList);
+        return page;
+    }
 
     @Override
     public Page<AppVO> getAppVOPage(Page<App> appPage, HttpServletRequest request) {

@@ -20,7 +20,7 @@ public interface QuestionService extends IService<Question> {
 
     QuestionVO getQuestionVO(Question question, HttpServletRequest request);
 
-    public QueryWrapper<Question> getQueryWrapper(QuestionQueryRequest questionQueryRequest);
+     QueryWrapper<Question> getQueryWrapper(QuestionQueryRequest questionQueryRequest);
 
     Page<QuestionVO> getQuestionVOPage(Page<Question> questionPage, HttpServletRequest request);
 }

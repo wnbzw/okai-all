@@ -176,6 +176,7 @@ public class AppController {
         // 查询数据库
         Page<App> appPage = appService.page(new Page<>(current, size),
                 appService.getQueryWrapper(appQueryRequest));
+        //Page<App> appPage = appService.searchFromEs(appQueryRequest);
         // 获取封装类
         return ResultUtils.success(appService.getAppVOPage(appPage, request));
     }

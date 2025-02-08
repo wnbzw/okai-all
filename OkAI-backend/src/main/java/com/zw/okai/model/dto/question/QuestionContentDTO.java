@@ -33,4 +33,21 @@ public class QuestionContentDTO {
         private String value;
         private String key;
     }
+
+    public static String getValue(List<Option> options, String key){
+        for(Option option : options){
+            if(option.getKey().equals(key)){
+                return option.getValue();
+            }
+        }
+        return key;
+    }
+    public static int getScore(List<Option> options, String key){
+        for(Option option : options){
+            if(option.getKey().equals(key)){
+                return option.getScore();
+            }
+        }
+        return 0;
+    }
 }
